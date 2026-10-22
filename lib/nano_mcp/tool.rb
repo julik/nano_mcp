@@ -18,22 +18,27 @@ module NanoMCP
   # A tool is instantiated once per call, with whatever the server's authentication
   # block returned as its context.
   class Tool
+    EMPTY_JSON_SCHEMA = Ractor.make_shareable({"type" => "object", "properties" => {}, "additionalProperties" => false})
+    private_constant :EMPTY_JSON_SCHEMA
+
+    # Everything set on the class is stored as a deep-frozen copy and nothing is computed
+    # lazily, because other Ractors can only read a class's instance variables if they are shareable
     class << self
       # @param value [String] the name agents call the tool by, `[A-Za-z0-9_.-]{1,128}`
       def tool_name(value = nil)
-        @tool_name = value.to_s if value
+        @tool_name = -value.to_s if value
         @tool_name
       end
 
       # @param value [String] a human-readable name for client UIs
       def title(value = nil)
-        @title = value.to_s if value
+        @title = -value.to_s if value
         @title
       end
 
       # @param value [String] what the tool does, written for the agent choosing it
       def description(value = nil)
-        @description = value.to_s.strip if value
+        @description = -value.to_s.strip if value
         @description
       end
 
@@ -45,10 +50,14 @@ module NanoMCP
       # @param value [Hash]
       def input_schema(value = nil)
         if value
-          @input_schema = value
-          @json_schema = nil
+          @input_schema = Ractor.make_shareable(value, copy: true)
+          schema = JSON.parse(JSON.generate(value))
+          schema["type"] = "object"
+          schema["properties"] ||= {}
+          schema["additionalProperties"] = false
+          @json_schema = Ractor.make_shareable(schema)
         end
-        @input_schema || {}
+        @input_schema || EMPTY_JSON_SCHEMA
       end
 
       # Behaviour hints for the client, passed through verbatim. Use the spec's names:
@@ -56,7 +65,7 @@ module NanoMCP
       #
       # @param value [Hash]
       def annotations(value = nil)
-        @annotations = value if value
+        @annotations = Ractor.make_shareable(value, copy: true) if value
         @annotations
       end
 
@@ -77,13 +86,7 @@ module NanoMCP
 
       # @api private
       def json_schema
-        @json_schema ||= begin
-          schema = JSON.parse(JSON.generate(input_schema))
-          schema["type"] = "object"
-          schema["properties"] ||= {}
-          schema["additionalProperties"] = false
-          schema.freeze
-        end
+        @json_schema || EMPTY_JSON_SCHEMA
       end
     end
 

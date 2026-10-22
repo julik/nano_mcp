@@ -135,6 +135,13 @@ class MyTool < NanoMCP::Tool
 end
 ```
 
+### Ractors
+
+A server can be built and called inside a non-main Ractor, and the test suite checks that.
+It can't be shared between Ractors, because its block and logger aren't shareable, so build one
+per Ractor. Tool classes store what you set on them as frozen copies, which is what makes them
+readable from other Ractors.
+
 ### Things the server does not do for you
 
 The server stays small by leaving these to the host:

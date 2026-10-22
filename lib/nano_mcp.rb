@@ -41,9 +41,11 @@ module NanoMCP
   def self.token_matches?(presented, configured)
     return false if presented.nil? || configured.nil?
     return false if configured.to_s.length < MINIMUM_TOKEN_LENGTH
+    # Not OpenSSL::Digest::SHA256: its methods come from define_method, and those
+    # cannot be called from a Ractor other than the one that loaded them
     OpenSSL.fixed_length_secure_compare(
-      OpenSSL::Digest::SHA256.digest(presented.to_s),
-      OpenSSL::Digest::SHA256.digest(configured.to_s)
+      OpenSSL::Digest.digest("SHA256", presented.to_s),
+      OpenSSL::Digest.digest("SHA256", configured.to_s)
     )
   end
 end
