@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- `Result.json` without a `summary:` now puts a line like "12 workflows in structuredContent."
+  in the text block for current clients, rather than the data again as JSON. This changes what
+  an existing call sends, which the compatibility rules in the README say we don't do - but both
+  apps using nano_mcp were working around the old behaviour, so it changes now rather than never.
+- `Server.new` takes `on_call:`, which hears about every tool call, for audit logging.
+- `Tool.annotations` set on a base class apply to its subclasses.
+
 ## 0.1.0
 
 Initial release, extracted from the MCP servers in geneva_drive_admin and Comptoir.

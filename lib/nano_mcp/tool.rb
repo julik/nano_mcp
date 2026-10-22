@@ -61,12 +61,13 @@ module NanoMCP
       end
 
       # Behaviour hints for the client, passed through verbatim. Use the spec's names:
-      # `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`.
+      # `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. Set on a
+      # base class, they apply to its subclasses until one sets its own.
       #
       # @param value [Hash]
       def annotations(value = nil)
         @annotations = Ractor.make_shareable(value, copy: true) if value
-        @annotations
+        @annotations || (superclass.annotations unless superclass == Tool)
       end
 
       # The `tools/list` entry for this tool. Override it (calling super) to vary the

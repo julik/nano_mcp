@@ -71,11 +71,12 @@ module NanoMCP
     # @param title [String, nil] `serverInfo.title` - say which app and environment this is
     # @param instructions [String, nil] handed to the client up front, usually ends up in the system prompt
     # @param allowed_origins [Array<String>] browser origins allowed to call, none by default
-    # @param logger [Logger, nil] gets a line per tool call and every internal error
+    # @param logger [Logger, nil] gets every internal error, and a line per tool call unless there is an `on_call`
+    # @param on_call [#call, nil] receives a frozen Hash after every tool call - see the README
     # @yieldparam env [Hash] the Rack env
     # @yieldparam meta [Hash] the request's `params._meta`, empty when there is none
     # @yieldreturn [Object, nil] the tool context, or nil/false to refuse with a 401
-    def initialize(name:, version:, tools:, title: nil, instructions: nil, allowed_origins: [], logger: nil, &authenticate)
+    def initialize(name:, version:, tools:, title: nil, instructions: nil, allowed_origins: [], logger: nil, on_call: nil, &authenticate)
       raise ArgumentError, "Pass a block which authenticates the request and returns the tool context, or nil to refuse" unless authenticate
 
       @name = name.to_s
@@ -84,6 +85,7 @@ module NanoMCP
       @instructions = instructions&.to_s
       @allowed_origins = Array(allowed_origins).map(&:to_s)
       @logger = logger
+      @on_call = on_call
       @authenticate = authenticate
       @tools = tools.each_with_object({}) do |tool, by_name|
         raise ArgumentError, "#{tool.inspect} is not a NanoMCP::Tool subclass" unless tool.is_a?(Class) && tool < Tool
@@ -264,24 +266,37 @@ module NanoMCP
       tool = @tools.fetch(name) { raise ProtocolError.new("Unknown tool: #{name}. Call tools/list to see what this server offers.", code: INVALID_PARAMS) }
 
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      result = begin
-        tool.new(context).invoke(params["arguments"])
-      rescue ToolError => e
-        Result.error(e.message)
-      end
-      raise TypeError, "#{tool}#call returned #{result.class}, not a NanoMCP::Result" unless result.is_a?(Result)
-
-      shaped = shape(result, modern)
-      log(:info) do
+      era = modern ? "modern" : "legacy"
+      begin
+        result = begin
+          tool.new(context).invoke(params["arguments"])
+        rescue ToolError => e
+          Result.error(e.message)
+        end
+        raise TypeError, "#{tool}#call returned #{result.class}, not a NanoMCP::Result" unless result.is_a?(Result)
+        shaped = shape(result, modern)
+        bytes = JSON.generate(shaped).bytesize
+      rescue => e
+        exception = e
+        raise
+      ensure
         elapsed_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round(1)
-        "tool=#{name} era=#{modern ? "modern" : "legacy"} error=#{result.error?} bytes=#{JSON.generate(shaped).bytesize} duration_ms=#{elapsed_ms}"
+        error = exception ? true : result.error?
+        log(:info) { "tool=#{name} era=#{era} error=#{error} bytes=#{bytes || "-"} duration_ms=#{elapsed_ms}" } unless @on_call
+        report_call(tool: name, era: era, context: context, arguments: params["arguments"], error: error,
+          bytes: bytes, duration_ms: elapsed_ms, exception: exception)
       end
       shaped
     end
 
+    def report_call(event)
+      @on_call&.call(event.freeze)
+    rescue => e
+      log(:error) { "on_call raised #{e.class}: #{e.message}" }
+    end
+
     # A client of an older revision may not read `structuredContent`, so it gets the
-    # data as JSON in prose. A current one gets the data once, plus the summary if
-    # there is one. An answer over the size cap goes out as truncated text: a clipped
+    # data as JSON in prose. A current one gets the data once, plus the summary. An answer over the size cap goes out as truncated text: a clipped
     # structure would be a lie about its own shape
     def shape(result, modern)
       return {content: [text_block(result.text)], isError: result.error?} if result.structured.nil?
@@ -294,7 +309,7 @@ module NanoMCP
       if json.bytesize > MAX_RESPONSE_BYTES
         return {content: [text_block(JSON.pretty_generate(result.structured))], isError: false}
       end
-      {content: [text_block(result.text || json)], structuredContent: result.structured, isError: false}
+      {content: [text_block(result.text)], structuredContent: result.structured, isError: false}
     end
 
     def text_block(string)

@@ -96,6 +96,23 @@ class ToolTest < Minitest::Test
     assert_includes @log.string, "not a NanoMCP::Result"
   end
 
+  def test_json_results_summarize_themselves
+    assert_equal "3 items in structuredContent.", NanoMCP::Result.json([1, 2, 3]).text
+    assert_equal "2 rows in structuredContent.", NanoMCP::Result.json({total: 2, rows: [1, 2]}).text
+    assert_equal "3 rows in structuredContent.", NanoMCP::Result.json({columns: %w[a b], rows: [1, 2, 3]}).text
+    assert_equal "See structuredContent.", NanoMCP::Result.json({id: 1}).text
+    assert_equal "Mine.", NanoMCP::Result.json({id: 1}, summary: "Mine.").text
+  end
+
+  def test_annotations_are_inherited_until_overridden
+    base = Class.new(NanoMCP::Tool) { annotations readOnlyHint: true }
+    plain = Class.new(base)
+    own = Class.new(base) { annotations readOnlyHint: false }
+    assert_equal({readOnlyHint: true}, plain.annotations)
+    assert_equal({readOnlyHint: false}, own.annotations)
+    assert_nil Bare.annotations
+  end
+
   def test_results_cannot_be_built_by_hand
     assert_raises(NoMethodError) { NanoMCP::Result.new("x", nil, false) }
     assert_raises(ArgumentError) { NanoMCP::Result.json(nil) }

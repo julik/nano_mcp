@@ -101,11 +101,47 @@ class ModernTest < Minitest::Test
     assert_equal "5 workflows, more available (pass next_cursor).", result["content"].first["text"]
   end
 
-  def test_structured_answer_without_summary_serializes_into_text
+  def test_structured_answer_without_summary_gets_one_made_up
     call_tool("get_workflow", {id: 3})
     assert_equal 3, result.dig("structuredContent", "id")
-    assert_equal result["structuredContent"], JSON.parse(result["content"].first["text"])
+    assert_equal "See structuredContent.", result["content"].first["text"]
     assert_equal "http://mcp.example.com/admin/workflows/3", result.dig("structuredContent", "admin_url")
+  end
+
+  def test_on_call_hears_about_every_call
+    events = []
+    @app = NanoMCP::Server.new(name: "x", version: "1", tools: WorkflowsMCP::TOOLS, on_call: ->(event) { events << event }) do |_env, meta|
+      WorkflowsMCP::Context.new(store: @store, base_url: "http://mcp.example.com",
+        identity: "token via #{meta.dig("io.modelcontextprotocol/clientInfo", "name")}")
+    end
+    call_tool("get_workflow", {id: 3})
+    call_tool("get_workflow", {id: 9999})
+    call_tool("explode")
+
+    ok, refused, exploded = events
+    assert_equal "get_workflow", ok[:tool]
+    assert_equal "modern", ok[:era]
+    assert_equal({"id" => 3}, ok[:arguments])
+    assert_equal "token via TestClient", ok[:context].identity
+    refute ok[:error]
+    assert_operator ok[:bytes], :>, 0
+    assert ok.frozen?
+
+    assert refused[:error]
+    assert_nil refused[:exception]
+
+    assert exploded[:error]
+    assert_nil exploded[:bytes]
+    assert_equal "secret row data", exploded[:exception].message
+  end
+
+  def test_on_call_that_raises_does_not_break_the_answer
+    @app = NanoMCP::Server.new(name: "x", version: "1", tools: [WorkflowsMCP::Tools::WorkflowDocs],
+      logger: Logger.new(@log), on_call: ->(_event) { raise "audit down" }) { WorkflowsMCP::Context.new }
+    call_tool("workflow_docs", {topic: "states"})
+    refute result["isError"]
+    assert_includes @log.string, "on_call raised RuntimeError: audit down"
+    refute_includes @log.string, "tool=workflow_docs", "on_call replaces the per-call line"
   end
 
   def test_cursor_pagination_walks_everything

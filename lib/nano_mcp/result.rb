@@ -12,17 +12,16 @@ module NanoMCP
       new(string.to_s, nil, false)
     end
 
-    # Structured data. A current client gets it as `structuredContent`, an older one
-    # gets it serialized into a text block. The text block a current client gets next
-    # to the data is `summary` when given, and the data as JSON when not - pass a summary
-    # to avoid sending a large answer twice.
+    # Structured data. A current client gets it as `structuredContent`, with `summary`
+    # in the text block next to it - or, without one, a line like "12 workflows in
+    # structuredContent.". An older client gets the data serialized into the text block.
     #
     # @param value [Hash, Array, String, Numeric, true, false] anything JSON can represent
     # @param summary [String, nil] a line saying what came back
     # @return [Result]
     def self.json(value, summary: nil)
       raise ArgumentError, "Result.json needs a value, use Result.text for an empty answer" if value.nil?
-      new(summary&.to_s, value, false)
+      new((summary || summarize(value)).to_s, value, false)
     end
 
     # A refusal or failure the agent should read and act on. Same as raising ToolError.
@@ -33,7 +32,18 @@ module NanoMCP
       new(message.to_s, nil, true)
     end
 
-    private_class_method :new
+    # The spec suggests repeating the data as JSON in the text block, but a client
+    # asking for the current revision reads structuredContent, and a second copy of a
+    # large answer just fills the agent's context window
+    def self.summarize(value)
+      count, noun = case value
+      when Array then [value.length, "items"]
+      when Hash then value.select { |_key, member| member.is_a?(Array) }.max_by { |_key, member| member.length }&.then { |key, member| [member.length, key] }
+      end
+      count ? "#{count} #{noun} in structuredContent." : "See structuredContent."
+    end
+
+    private_class_method :new, :summarize
 
     # @return [String, nil] the text, or the summary of a structured result
     attr_reader :text

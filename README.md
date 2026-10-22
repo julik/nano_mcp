@@ -98,8 +98,12 @@ or run it from a `config.ru`. See [examples/](examples) for a complete server, w
 
 - `Result.text(string)` - prose
 - `Result.json(value, summary: nil)` - structured data. A current client gets it as
-  `structuredContent`, next to a text block holding `summary` (or the JSON itself if you gave no
-  summary). An older client gets the JSON in the text block.
+  `structuredContent`, next to a text block holding `summary`, or a line like "12 workflows in
+  structuredContent." if you gave none. An older client gets the JSON in the text block.
+
+  The spec suggests repeating the data as JSON in the text block. We don't: a client on the
+  current revision reads `structuredContent`, and a second copy of a large answer just fills the
+  agent's context window.
 - `Result.error(message)` - a refusal the agent should read. Raising `NanoMCP::ToolError` does the same.
 
 Bad arguments come back as error results too, worded so an agent can fix its call. Any other
@@ -120,9 +124,12 @@ There are two hooks for house rules, both meant to be overridden in your own bas
 
 ```ruby
 class MyTool < NanoMCP::Tool
+  # Every tool of ours unless it says otherwise - annotations are inherited
+  annotations readOnlyHint: true, openWorldHint: false
+
   def self.mutating
     @mutating = true
-    annotations readOnlyHint: false, destructiveHint: false
+    annotations readOnlyHint: false, destructiveHint: false, openWorldHint: false
   end
 
   def self.mutating? = !!@mutating
@@ -186,7 +193,23 @@ The server stays small by leaving these to the host:
 - **Building the server from runtime settings.** Constructing one is cheap, so build it per request
   if its instructions or tools depend on configuration.
 - **Logging arguments.** The log line per call has the tool, era, error flag, size and duration.
-  Arguments are left out because they may carry secrets. Log them in `#invoke` if you need them.
+  Arguments are left out because they may carry secrets. For an audit trail, see `on_call` below.
+
+### Auditing calls
+
+Pass `on_call:` and it gets a frozen Hash after every tool call, including ones that raised:
+
+```ruby
+on_call: ->(event) do
+  Rails.logger.info "mcp tool=#{event[:tool]} caller=#{event[:context].user.email} error=#{event[:error]}"
+end
+```
+
+The keys are `tool`, `era` (`"modern"` or `"legacy"`), `context` (what your block returned),
+`arguments` (as they came off the wire), `error`, `bytes` (of the response, nil if the tool
+raised), `duration_ms` and `exception` (nil unless the tool raised). With an `on_call` the logger no longer gets a line per call, since yours replaces it.
+An `on_call` that raises is logged and otherwise ignored. It runs after the tool, so it can't wrap the tool's own logging -
+put log tags in `#invoke` for that.
 
 ## Public API
 
@@ -198,7 +221,7 @@ This is all of it. Everything else is private, whatever Ruby visibility it happe
 - `NanoMCP::Tool`: class methods `tool_name`, `title`, `description`, `input_schema`, `annotations`,
   `descriptor(context)`. Instance methods `#initialize(context)`, `#context`, `#invoke(arguments)`, `#call(**)`
 - `NanoMCP::Result`: `.text`, `.json`, `.error`, `#text`, `#structured`, `#error?`
-- `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, &authenticate)` and `#call(env)`.
+- `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, on_call:, &authenticate)` and `#call(env)`.
   The block is called with `(env, meta)`
 
 ## Protocol behaviour

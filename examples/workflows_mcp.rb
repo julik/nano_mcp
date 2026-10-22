@@ -50,6 +50,8 @@ module WorkflowsMCP
   # The house base class, like GenevaDrive::Admin::MCP::Tool: the mutation gate lives
   # in one place, in #invoke, so no mutating tool can forget it
   class Tool < NanoMCP::Tool
+    annotations readOnlyHint: true, openWorldHint: false
+
     def self.mutating(destructive: false)
       @mutating = true
       annotations(readOnlyHint: false, destructiveHint: destructive, idempotentHint: true, openWorldHint: false)
@@ -59,7 +61,6 @@ module WorkflowsMCP
 
     def self.descriptor(context)
       entry = super
-      entry[:annotations] ||= {readOnlyHint: true, openWorldHint: false}
       if mutating? && !context.mutations_permitted
         entry[:description] += "\n\nCURRENTLY DISABLED: mutations are turned off for you. Calling this will explain how to enable them."
       end
