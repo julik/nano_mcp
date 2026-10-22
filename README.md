@@ -137,10 +137,29 @@ end
 
 ### Ractors
 
-A server can be built and called inside a non-main Ractor, and the test suite checks that.
-It can't be shared between Ractors, because its block and logger aren't shareable, so build one
-per Ractor. Tool classes store what you set on them as frozen copies, which is what makes them
-readable from other Ractors.
+A server works from non-main Ractors in two ways, and the test suite checks both.
+
+**One server per Ractor.** Build it inside the Ractor, and anything goes: any block, any logger.
+
+**One server shared by every Ractor**, which is what a Ractor-based Rack server loading a
+`config.ru` would want. The server's own state is all frozen, so `Ractor.make_shareable` works on it
+as long as the two things you hand it are shareable too:
+
+- The block has to be a shareable proc. A block written in `config.ru` has the Rack builder as its
+  `self`, which is not shareable, so create it with a `nil` self instead. It may only refer to
+  shareable things, such as frozen constants.
+- The logger has to be shareable or left out. A standard `Logger` is not, and freezing it breaks it.
+
+```ruby
+# Ruby 4.0
+authenticate = Ractor.shareable_proc { |env, meta| ... }
+# Ruby 3.2 and up
+authenticate = nil.instance_eval { proc { |env, meta| ... } }
+
+run Ractor.make_shareable(NanoMCP::Server.new(name: "workflows", version: "1", tools: TOOLS, &authenticate))
+```
+
+Tool classes store whatever you set on them as frozen copies, so they can be read from any Ractor.
 
 ### Things the server does not do for you
 

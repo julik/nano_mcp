@@ -2,9 +2,8 @@
 
 require "test_helper"
 
-# A smoke test, not a guarantee: a server built inside a non-main Ractor has to be able
-# to answer from there. A server cannot be shared between Ractors (its block and logger
-# are not shareable), so each Ractor builds its own
+# Smoke tests, not guarantees: a server has to answer from inside non-main Ractors,
+# both when each Ractor builds its own and when one is built up front and shared
 class RactorTest < Minitest::Test
   def test_servers_answer_from_inside_ractors
     previous, Warning[:experimental] = Warning[:experimental], false
@@ -65,5 +64,55 @@ class RactorTest < Minitest::Test
     end
   ensure
     Warning[:experimental] = previous
+  end
+
+  def test_one_shareable_server_answers_from_several_ractors
+    previous, Warning[:experimental] = Warning[:experimental], false
+
+    # What a config.ru for a Ractor-based Rack server would do. The block may only refer
+    # to shareable things, and the store is built per request because it holds a Mutex
+    authenticate = nil.instance_eval do
+      proc do |env, meta|
+        next nil unless NanoMCP.token_matches?(NanoMCP.bearer_token(env), MCPRequests::TOKEN)
+        WorkflowsMCP::Context.new(store: WorkflowsMCP::Store.seeded, base_url: "http://shared.example.com",
+          identity: meta.dig("io.modelcontextprotocol/clientInfo", "name"), mutations_permitted: false)
+      end
+    end
+    server = NanoMCP::Server.new(name: "shared", version: "1", tools: WorkflowsMCP::TOOLS, &authenticate)
+    Ractor.make_shareable(server)
+    assert Ractor.shareable?(server)
+
+    ractors = 4.times.map do |index|
+      Ractor.new(server, index, MCPRequests::TOKEN, NanoMCP::PROTOCOL_VERSION) do |server, index, token, version|
+        params = {name: "get_server_status", _meta: {
+          "io.modelcontextprotocol/protocolVersion" => version,
+          "io.modelcontextprotocol/clientInfo" => {"name" => "client#{index}"}
+        }}
+        env = {
+          "REQUEST_METHOD" => "POST",
+          "rack.input" => StringIO.new(JSON.generate({jsonrpc: "2.0", id: index, method: "tools/call", params: params})),
+          "HTTP_AUTHORIZATION" => "Bearer #{token}",
+          "HTTP_MCP_PROTOCOL_VERSION" => version,
+          "HTTP_MCP_METHOD" => "tools/call",
+          "HTTP_MCP_NAME" => "get_server_status"
+        }
+        status, _, body = server.call(env)
+        [status, JSON.parse(body.join)]
+      end
+    end
+
+    ractors.each_with_index do |ractor, index|
+      status, body = ractor.respond_to?(:value) ? ractor.value : ractor.take
+      assert_equal 200, status
+      assert_equal "client#{index}", body.dig("result", "structuredContent", "identity")
+    end
+  ensure
+    Warning[:experimental] = previous
+  end
+
+  def test_a_block_with_an_unshareable_self_says_so
+    server = NanoMCP::Server.new(name: "x", version: "1", tools: []) { |env| env }
+    error = assert_raises(Ractor::IsolationError) { Ractor.make_shareable(server) }
+    assert_includes error.message, "self is not shareable"
   end
 end
