@@ -1,0 +1,331 @@
+# frozen_string_literal: true
+
+module NanoMCP
+  # The MCP endpoint, as a Rack app. Mount it wherever you like:
+  #
+  #   SERVER = NanoMCP::Server.new(name: "comptoir", version: "1", tools: [ListSnapshots]) do |env|
+  #     Context.new(...) if NanoMCP.token_matches?(NanoMCP.bearer_token(env), ENV["MCP_TOKEN"])
+  #   end
+  #   mount SERVER => "/mcp"
+  #
+  # Stateless all the way down: no sessions, no streams, nothing remembered between
+  # requests, so any process can answer any request. It speaks revision 2026-07-28,
+  # where every request carries its own protocol version in `_meta`. A client of
+  # 2025-11-25 or earlier opens with `initialize` instead, and gets answered the way
+  # those revisions expect - minus the session, which they never strictly needed.
+  #
+  # The block authenticates. It receives the Rack env and returns the context every
+  # tool in this request gets, or nil/false to refuse the request with a 401. A block
+  # that raises refuses too.
+  class Server
+    MODERN_VERSIONS = [PROTOCOL_VERSION].freeze
+    LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"].freeze
+
+    META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+    META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+
+    PARSE_ERROR = -32700
+    INVALID_REQUEST = -32600
+    METHOD_NOT_FOUND = -32601
+    INVALID_PARAMS = -32602
+    INTERNAL_ERROR = -32603
+    UNAUTHORIZED = -32001
+    HEADER_MISMATCH = -32020
+    UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+    # How long a client may cache the tool list. It only changes on a deploy, and
+    # "private" because it may vary with the caller
+    TOOL_LIST_TTL_MS = 300_000
+    CACHE_SCOPE = "private"
+
+    MAX_REQUEST_BYTES = 1_000_000
+    MAX_RESPONSE_BYTES = 1_000_000
+
+    BASE64_SENTINEL = /\A=\?base64\?(.*)\?=\z/m
+
+    # Methods whose `Mcp-Name` header mirrors a body param
+    NAMED_METHODS = {"tools/call" => "name", "prompts/get" => "name", "resources/read" => "uri"}.freeze
+
+    private_constant(*constants)
+
+    class ProtocolError < StandardError
+      attr_reader :code, :status, :data
+
+      def initialize(message, code:, status: 200, data: nil)
+        super(message)
+        @code = code
+        @status = status
+        @data = data
+      end
+    end
+    private_constant :ProtocolError
+
+    # @param name [String] `serverInfo.name`, which clients key on - keep it fixed
+    # @param version [String] `serverInfo.version`
+    # @param tools [Array<Class>] NanoMCP::Tool subclasses, listed in this order
+    # @param title [String, nil] `serverInfo.title` - say which app and environment this is
+    # @param instructions [String, nil] handed to the client up front, usually ends up in the system prompt
+    # @param allowed_origins [Array<String>] browser origins allowed to call, none by default
+    # @param logger [Logger, nil] gets a line per tool call and every internal error
+    # @yieldparam env [Hash] the Rack env
+    # @yieldreturn [Object, nil] the tool context, or nil/false to refuse with a 401
+    def initialize(name:, version:, tools:, title: nil, instructions: nil, allowed_origins: [], logger: nil, &authenticate)
+      raise ArgumentError, "Pass a block which authenticates the request and returns the tool context, or nil to refuse" unless authenticate
+
+      @name = name.to_s
+      @version = version.to_s
+      @title = title&.to_s
+      @instructions = instructions&.to_s
+      @allowed_origins = Array(allowed_origins).map(&:to_s)
+      @logger = logger
+      @authenticate = authenticate
+      @tools = tools.each_with_object({}) do |tool, by_name|
+        raise ArgumentError, "#{tool.inspect} is not a NanoMCP::Tool subclass" unless tool.is_a?(Class) && tool < Tool
+        tool_name = tool.tool_name.to_s
+        raise ArgumentError, "#{tool} has no tool_name" if tool_name.empty?
+        raise ArgumentError, "Two tools are named #{tool_name}" if by_name.key?(tool_name)
+        by_name[tool_name] = tool
+      end.freeze
+    end
+
+    # @param env [Hash] the Rack env
+    # @return [Array] a Rack response
+    def call(env)
+      # GET opened a stream and DELETE ended a session in older revisions. The current
+      # one tells a server with neither to answer exactly this
+      unless env["REQUEST_METHOD"] == "POST"
+        return respond(405, error_body(nil, METHOD_NOT_FOUND, "This MCP server is stateless and POST-only. POST JSON-RPC requests to this same URL."), "allow" => "POST")
+      end
+
+      # Required by the transport to defeat DNS rebinding. MCP clients send no Origin
+      unless origin_permitted?(env["HTTP_ORIGIN"])
+        return respond(403, error_body(nil, INVALID_REQUEST, "Origin not allowed"))
+      end
+
+      context = authenticate(env)
+      unless context
+        return respond(401, error_body(nil, UNAUTHORIZED, "Unauthorized: send a valid bearer token in the Authorization header"),
+          "www-authenticate" => %(Bearer realm="#{@name}"))
+      end
+
+      body = read_body(env)
+      return respond(413, error_body(nil, INVALID_REQUEST, "Request body over #{MAX_REQUEST_BYTES} bytes")) unless body
+
+      request = begin
+        JSON.parse(body)
+      rescue JSON::ParserError
+        return respond(400, error_body(nil, PARSE_ERROR, "Parse error: body is not valid JSON"))
+      end
+
+      status, payload = handle(request, env, context)
+      payload ? respond(status, payload) : [status, {}, []]
+    end
+
+    private
+
+    def handle(request, env, context)
+      return [400, error_body(nil, INVALID_REQUEST, "Batches are not supported, send one JSON-RPC request per POST")] if request.is_a?(Array)
+      return [400, error_body(nil, INVALID_REQUEST, "Request must be a JSON object")] unless request.is_a?(Hash)
+
+      id = request["id"]
+      method = request["method"]
+      params = request.fetch("params", nil) || {}
+      return [400, error_body(id, INVALID_REQUEST, "Request has no method")] unless method.is_a?(String)
+      return [400, error_body(id, INVALID_REQUEST, "params must be an object")] unless params.is_a?(Hash)
+
+      # A notification. None of them need anything from us
+      return [202, nil] unless request.key?("id")
+
+      modern = modern?(method, params, env)
+      validate_modern_request!(method, params, env) if modern
+      result = dispatch(method, params, context, modern)
+      result[:resultType] = "complete" if modern
+      [200, {jsonrpc: "2.0", id: id, result: result}]
+    rescue ProtocolError => e
+      [e.status, error_body(id, e.code, e.message, e.data)]
+    rescue => e
+      log(:error) { "#{method} raised #{e.class}: #{e.message}\n#{Array(e.backtrace).first(10).join("\n")}" }
+      # The message may carry the host's data, so it stays in the host's logs
+      [200, error_body(id, INTERNAL_ERROR, "Internal error (#{e.class}). See the server logs.")]
+    end
+
+    # The spec's rule for serving both eras: `initialize` always selects the old one,
+    # and per-request `_meta` the new one. A modern header with no `_meta` is a broken
+    # modern request rather than an old one, and gets told so
+    def modern?(method, params, env)
+      return false if method == "initialize"
+      !meta_version(params).nil? || MODERN_VERSIONS.include?(env["HTTP_MCP_PROTOCOL_VERSION"])
+    end
+
+    def meta_version(params)
+      meta = params["_meta"]
+      meta.is_a?(Hash) ? meta[META_PROTOCOL_VERSION] : nil
+    end
+
+    # The headers mirror the body so a load balancer can route without parsing it.
+    # That only holds if both say the same, so anything that disagrees is refused
+    def validate_modern_request!(method, params, env)
+      version = meta_version(params)
+      if version.nil?
+        raise ProtocolError.new("Header mismatch: request has no _meta[#{META_PROTOCOL_VERSION}]", code: HEADER_MISMATCH, status: 400)
+      end
+      unless MODERN_VERSIONS.include?(version)
+        raise ProtocolError.new("Unsupported protocol version: #{version}",
+          code: UNSUPPORTED_PROTOCOL_VERSION, status: 400,
+          data: {supported: MODERN_VERSIONS + LEGACY_VERSIONS, requested: version})
+      end
+
+      header_matches!("MCP-Protocol-Version", env["HTTP_MCP_PROTOCOL_VERSION"], version)
+      header_matches!("Mcp-Method", env["HTTP_MCP_METHOD"], method)
+      if (param = NAMED_METHODS[method]) && params.key?(param)
+        header_matches!("Mcp-Name", decode_header(env["HTTP_MCP_NAME"]), params[param].to_s)
+      end
+    end
+
+    def header_matches!(header_name, header_value, body_value)
+      if header_value.nil?
+        raise ProtocolError.new("Header mismatch: #{header_name} header is required", code: HEADER_MISMATCH, status: 400)
+      end
+      return if header_value == body_value
+      raise ProtocolError.new("Header mismatch: #{header_name} header value #{header_value.inspect} does not match body value #{body_value.inspect}",
+        code: HEADER_MISMATCH, status: 400)
+    end
+
+    def decode_header(value)
+      match = BASE64_SENTINEL.match(value.to_s)
+      return value unless match
+      match[1].unpack1("m0").force_encoding(Encoding::UTF_8)
+    rescue ArgumentError
+      raise ProtocolError.new("Header mismatch: malformed base64 in Mcp-Name", code: HEADER_MISMATCH, status: 400)
+    end
+
+    def dispatch(method, params, context, modern)
+      case [method, modern]
+      in ["server/discover", true] then discover_result
+      in ["initialize", false] then initialize_result(params)
+      in ["ping", false] then {}
+      in ["tools/list", _] then tools_list_result(context, modern)
+      in ["tools/call", _] then call_tool(params, context, modern)
+      else
+        # In the current revision the 404 is how a client tells "no such method"
+        # apart from "not an MCP endpoint at all"
+        raise ProtocolError.new("Method not found: #{method}", code: METHOD_NOT_FOUND, status: modern ? 404 : 200)
+      end
+    end
+
+    def discover_result
+      {
+        supportedVersions: MODERN_VERSIONS,
+        capabilities: {tools: {listChanged: false}},
+        instructions: @instructions,
+        ttlMs: TOOL_LIST_TTL_MS,
+        cacheScope: CACHE_SCOPE,
+        _meta: {META_SERVER_INFO => server_info}
+      }.compact
+    end
+
+    def initialize_result(params)
+      requested = params["protocolVersion"]
+      {
+        protocolVersion: LEGACY_VERSIONS.include?(requested) ? requested : LEGACY_VERSIONS.first,
+        capabilities: {tools: {listChanged: false}},
+        serverInfo: server_info,
+        instructions: @instructions
+      }.compact
+    end
+
+    def server_info
+      {name: @name, title: @title, version: @version}.compact
+    end
+
+    def tools_list_result(context, modern)
+      result = {tools: @tools.values.map { |tool| tool.descriptor(context) }}
+      modern ? result.merge(ttlMs: TOOL_LIST_TTL_MS, cacheScope: CACHE_SCOPE) : result
+    end
+
+    def call_tool(params, context, modern)
+      name = params["name"]
+      raise ProtocolError.new("tools/call needs a tool name", code: INVALID_PARAMS) unless name.is_a?(String)
+      tool = @tools.fetch(name) { raise ProtocolError.new("Unknown tool: #{name}. Call tools/list to see what this server offers.", code: INVALID_PARAMS) }
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = begin
+        tool.new(context).invoke(params["arguments"])
+      rescue ToolError => e
+        Result.error(e.message)
+      end
+      raise TypeError, "#{tool}#call returned #{result.class}, not a NanoMCP::Result" unless result.is_a?(Result)
+
+      shaped = shape(result, modern)
+      log(:info) do
+        elapsed_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round(1)
+        "tool=#{name} era=#{modern ? "modern" : "legacy"} error=#{result.error?} bytes=#{JSON.generate(shaped).bytesize} duration_ms=#{elapsed_ms}"
+      end
+      shaped
+    end
+
+    # A client of an older revision may not read `structuredContent`, so it gets the
+    # data as JSON in prose. A current one gets the data once, plus the summary if
+    # there is one. An answer over the size cap goes out as truncated text: a clipped
+    # structure would be a lie about its own shape
+    def shape(result, modern)
+      return {content: [text_block(result.text)], isError: result.error?} if result.structured.nil?
+
+      unless modern
+        return {content: [text_block(JSON.pretty_generate(result.structured))], isError: false}
+      end
+
+      json = JSON.generate(result.structured)
+      if json.bytesize > MAX_RESPONSE_BYTES
+        return {content: [text_block(JSON.pretty_generate(result.structured))], isError: false}
+      end
+      {content: [text_block(result.text || json)], structuredContent: result.structured, isError: false}
+    end
+
+    def text_block(string)
+      string = string.to_s
+      if string.bytesize > MAX_RESPONSE_BYTES
+        string = string.byteslice(0, MAX_RESPONSE_BYTES).scrub("") + "\n\n[truncated: response exceeded #{MAX_RESPONSE_BYTES} bytes]"
+      end
+      {type: "text", text: string}
+    end
+
+    def authenticate(env)
+      @authenticate.call(env)
+    rescue => e
+      log(:error) { "authentication raised #{e.class}: #{e.message} - refusing" }
+      nil
+    end
+
+    # Absent is fine, since MCP clients are not browsers. A present one has to be listed:
+    # comparing it to our own Host proves nothing after a rebind, because the browser
+    # then sends the attacker's name in both
+    def origin_permitted?(origin)
+      return true if origin.nil? || origin.empty?
+      @allowed_origins.any? { |allowed| origin.casecmp?(allowed) }
+    end
+
+    def read_body(env)
+      input = env["rack.input"]
+      return "" unless input
+      input.rewind if input.respond_to?(:rewind)
+      body = input.read(MAX_REQUEST_BYTES + 1).to_s
+      input.rewind if input.respond_to?(:rewind)
+      (body.bytesize > MAX_REQUEST_BYTES) ? nil : body
+    end
+
+    def respond(status, payload, headers = {})
+      [status, {"content-type" => "application/json"}.merge(headers), [JSON.generate(payload)]]
+    end
+
+    def error_body(id, code, message, data = nil)
+      error = {code: code, message: message}
+      error[:data] = data if data
+      {jsonrpc: "2.0", id: id, error: error}
+    end
+
+    def log(level, &message)
+      @logger&.public_send(level) { "[nano_mcp] server=#{@name} #{message.call}" }
+    end
+  end
+end

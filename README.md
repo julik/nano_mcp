@@ -1,0 +1,185 @@
+# nano_mcp
+
+A (slightly unhinged) library for building small MCPs.
+
+> [!IMPORTANT]
+> **This gem is for my own private use.** It is public so that my other gems can depend on it,
+> not because I am looking to support it for anyone else. It sits underneath several of my
+> gems and apps at once - a diamond dependency - and that comes with **strict
+> backwards-compatibility constraints**:
+>
+> - The public API is the short list under [Public API](#public-api), and nothing else.
+> - Within a major version that list only ever grows. Nothing on it gets renamed, removed or
+>   changes meaning.
+> - Anything not on the list - private constants, the log line format, error message wording -
+>   can change in any release.
+> - Feature requests that grow the surface will most likely be declined. Bug reports are welcome.
+>
+> If you need something bigger, use [the official Ruby SDK](https://github.com/modelcontextprotocol/ruby-sdk).
+
+## What it is
+
+A Rack app that serves [MCP](https://modelcontextprotocol.io) tools over Streamable HTTP, written
+against the **stateless** revision of the spec, [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28).
+It has:
+
+- no sessions, no SSE, no GET stream - every request is one POST, and any process can serve it
+- no runtime dependencies - not even Rack, only `json` and `openssl` from the standard library
+- tools only - no resources, prompts, sampling or elicitation
+
+Clients of revision 2025-11-25 and earlier open with `initialize` instead of putting the protocol
+version in every request. They get answered the way they expect, from the same endpoint, but still
+without a session.
+
+## Installation
+
+```ruby
+gem "nano_mcp"
+```
+
+## Usage
+
+A tool is a class with a name, a description, an input schema and a `#call`:
+
+```ruby
+class GetWorkflow < NanoMCP::Tool
+  tool_name "get_workflow"
+  title "Get workflow"
+  description "One workflow by id, with its state and hero"
+  input_schema properties: {id: {type: "integer", minimum: 1}}, required: ["id"]
+  annotations readOnlyHint: true, openWorldHint: false
+
+  def call(id:)
+    workflow = context.store.find(id) or raise NanoMCP::ToolError, "No workflow with id #{id}"
+    NanoMCP::Result.json(workflow.to_h)
+  end
+end
+```
+
+A server is a Rack app with a list of tools and a block that authenticates. The block gets the Rack
+env and returns whatever your tools should see as `context`, or `nil` to refuse with a 401:
+
+```ruby
+MCP_SERVER = NanoMCP::Server.new(
+  name: "workflows",
+  title: "Workflows on #{Rails.application.class.module_parent_name} (#{Rails.env})",
+  version: MyGem::VERSION,
+  instructions: "Read this before drawing conclusions: `paused` is not a crash...",
+  tools: [GetWorkflow, SearchWorkflows],
+  logger: Rails.logger
+) do |env|
+  next unless NanoMCP.token_matches?(NanoMCP.bearer_token(env), ENV["WORKFLOWS_MCP_TOKEN"])
+  MyContext.new(store: Workflow, base_url: "https://#{env["HTTP_HOST"]}")
+end
+```
+
+Mount it:
+
+```ruby
+# config/routes.rb
+mount MCP_SERVER => "/mcp"
+```
+
+or run it from a `config.ru`. See [examples/](examples) for a complete server, which the tests drive.
+
+### Results
+
+`#call` returns a `NanoMCP::Result`:
+
+- `Result.text(string)` - prose
+- `Result.json(value, summary: nil)` - structured data. A current client gets it as
+  `structuredContent`, next to a text block holding `summary` (or the JSON itself if you gave no
+  summary). An older client gets the JSON in the text block.
+- `Result.error(message)` - a refusal the agent should read. Raising `NanoMCP::ToolError` does the same.
+
+Bad arguments come back as error results too, worded so an agent can fix its call. Any other
+exception becomes a JSON-RPC internal error that names the exception class. The message stays in
+your logs, since it may carry your data.
+
+### Arguments
+
+Arguments are checked against `input_schema` before `#call` sees them, and passed as keywords.
+The checker handles the top level of the schema: `type`, `required`, `enum`, `minimum`, `maximum`,
+`minLength`, `maxLength`, `minItems`, `maxItems`, `items` and `default`. Unknown arguments are
+refused, and the schema sent to clients says `additionalProperties: false` to match. Integers sent
+as strings are accepted, because agents do that. A number over `maximum` is clamped down to it rather than refused.
+
+### Wrapping every tool
+
+There are two hooks for house rules, both meant to be overridden in your own base class:
+
+```ruby
+class MyTool < NanoMCP::Tool
+  # Around every call: permission gates, log tags, timeouts
+  def invoke(arguments)
+    return NanoMCP::Result.error("Mutations are disabled here") if mutating? && !context.mutations_permitted?
+    Rails.logger.tagged("mcp_tool=#{self.class.tool_name}") { super }
+  end
+
+  # The tools/list entry, per caller
+  def self.descriptor(context)
+    entry = super
+    entry[:description] += "\n\nDISABLED for you" if mutating? && !context.mutations_permitted?
+    entry
+  end
+end
+```
+
+### Things the server does not do for you
+
+The server stays small by leaving these to the host:
+
+- **Turning it off.** Wrap it: `->(env) { enabled? ? MCP_SERVER.call(env) : [404, {}, []] }`.
+- **Pretending to be absent.** To answer 404 rather than 401 to a caller without a token, check the
+  token in a wrapper like the one above.
+- **Building the server from runtime settings.** Constructing one is cheap, so build it per request
+  if its instructions or tools depend on configuration.
+- **Logging arguments.** The log line per call has the tool, era, error flag, size and duration.
+  Arguments are left out because they may carry secrets. Log them in `#invoke` if you need them.
+
+## Public API
+
+This is all of it. Everything else is private, whatever Ruby visibility it happens to have.
+
+- `NanoMCP::VERSION`, `NanoMCP::PROTOCOL_VERSION`, `NanoMCP::MINIMUM_TOKEN_LENGTH`
+- `NanoMCP.bearer_token(env)`, `NanoMCP.token_matches?(presented, configured)`
+- `NanoMCP::Error`, `NanoMCP::ToolError`
+- `NanoMCP::Tool`: class methods `tool_name`, `title`, `description`, `input_schema`, `annotations`,
+  `descriptor(context)`. Instance methods `#initialize(context)`, `#context`, `#invoke(arguments)`, `#call(**)`
+- `NanoMCP::Result`: `.text`, `.json`, `.error`, `#text`, `#structured`, `#error?`
+- `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, &authenticate)` and `#call(env)`
+
+## Protocol behaviour
+
+| | 2026-07-28 (`_meta` in every request) | 2025-11-25 and earlier (`initialize`) |
+|-|-|-|
+| Handshake | `server/discover`, optional | `initialize`, answered and forgotten |
+| Version | checked on every request, 400 + `-32022` if unsupported | negotiated in `initialize` |
+| `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` | required, must match the body (400 + `-32020`) | ignored |
+| Unknown method | 404 + `-32601` | 200 + `-32601` |
+| `ping` | gone | `{}` |
+| Results | `resultType: "complete"`, `ttlMs`/`cacheScope` on lists | plain |
+| Structured results | `structuredContent` plus a text block | JSON in a text block |
+
+In both eras:
+
+- GET, DELETE and other verbs get a 405.
+- No session id is ever issued.
+- A notification gets an empty 202.
+- Batches are refused.
+- A request with an `Origin` header is refused with a 403 unless that origin is in
+  `allowed_origins`. MCP clients don't send `Origin`, browsers do. Comparing it against the
+  server's own host would not help: after a DNS rebind, the attacker's page sends its own name in both.
+- Bodies over 1MB get a 413. Responses over 1MB are truncated, with a note saying so.
+
+## Development
+
+```
+bundle install
+bundle exec rake          # tests and standard
+WORKFLOWS_MCP_TOKEN=$(ruby -rsecurerandom -e 'puts SecureRandom.hex(32)') rackup examples/config.ru
+```
+
+## License
+
+MIT
