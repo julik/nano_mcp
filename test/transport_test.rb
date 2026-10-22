@@ -25,6 +25,27 @@ class TransportTest < Minitest::Test
     assert_includes @log.string, "db down"
   end
 
+  def test_authentication_sees_the_request_meta
+    seen = []
+    @app = NanoMCP::Server.new(name: "x", version: "1", tools: []) { |_env, meta| seen << meta }
+    modern("tools/list")
+    assert_equal "TestClient", seen.last.dig("io.modelcontextprotocol/clientInfo", "name")
+    legacy("tools/list")
+    assert_equal({}, seen.last)
+    post("{nope")
+    assert_equal({}, seen.last)
+  end
+
+  def test_authentication_lambda_may_take_only_the_env
+    @app = NanoMCP::Server.new(name: "x", version: "1", tools: [], &->(env) { env["HTTP_AUTHORIZATION"] })
+    assert_equal 200, modern("tools/list")
+  end
+
+  def test_refusal_comes_before_anything_about_the_body
+    assert_equal 401, post("{nope", {"HTTP_AUTHORIZATION" => nil})
+    assert_equal 401, post("x" * 1_000_001, {"HTTP_AUTHORIZATION" => nil})
+  end
+
   def test_server_without_authentication_block_is_refused
     assert_raises(ArgumentError) { NanoMCP::Server.new(name: "x", version: "1", tools: []) }
   end

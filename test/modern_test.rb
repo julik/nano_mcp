@@ -18,6 +18,11 @@ class ModernTest < Minitest::Test
     assert_equal "application/json", @headers["content-type"]
   end
 
+  def test_tools_can_see_who_called_through_the_context
+    call_tool("get_server_status")
+    assert_equal "token via TestClient", result.dig("structuredContent", "identity")
+  end
+
   def test_never_mints_a_session
     modern("server/discover", headers: {"HTTP_MCP_SESSION_ID" => "pretend-i-have-one"})
     assert_equal 200, @status

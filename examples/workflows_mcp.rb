@@ -238,10 +238,11 @@ module WorkflowsMCP
       tools: TOOLS,
       allowed_origins: allowed_origins,
       logger: logger
-    ) do |env|
+    ) do |env, meta|
       next nil unless NanoMCP.token_matches?(NanoMCP.bearer_token(env), token)
       scheme = env["HTTP_X_FORWARDED_PROTO"] || env["rack.url_scheme"]
-      Context.new(store: store, identity: "token", mutations_permitted: mutations_permitted, base_url: "#{scheme}://#{env["HTTP_HOST"] || env["SERVER_NAME"]}")
+      client = meta.dig("io.modelcontextprotocol/clientInfo", "name") || "unknown client"
+      Context.new(store: store, identity: "token via #{client}", mutations_permitted: mutations_permitted, base_url: "#{scheme}://#{env["HTTP_HOST"] || env["SERVER_NAME"]}")
     end
   end
 end

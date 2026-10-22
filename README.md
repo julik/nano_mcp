@@ -57,7 +57,8 @@ end
 ```
 
 A server is a Rack app with a list of tools and a block that authenticates. The block gets the Rack
-env and returns whatever your tools should see as `context`, or `nil` to refuse with a 401:
+env and the request's `_meta`, and returns whatever your tools should see as `context`, or `nil` to
+refuse with a 401:
 
 ```ruby
 MCP_SERVER = NanoMCP::Server.new(
@@ -67,11 +68,20 @@ MCP_SERVER = NanoMCP::Server.new(
   instructions: "Read this before drawing conclusions: `paused` is not a crash...",
   tools: [GetWorkflow, SearchWorkflows],
   logger: Rails.logger
-) do |env|
-  next unless NanoMCP.token_matches?(NanoMCP.bearer_token(env), ENV["WORKFLOWS_MCP_TOKEN"])
-  MyContext.new(store: Workflow, base_url: "https://#{env["HTTP_HOST"]}")
+) do |env, meta|
+  key = ApiToken.find_by(token: NanoMCP.bearer_token(env))
+  next if key.nil? || key.expired?
+  MyContext.new(user: key.user, client: meta.dig("io.modelcontextprotocol/clientInfo", "name"))
 end
 ```
+
+The context is how tools know who is calling: whatever the block returns is `context` in every tool
+for that request, and nano_mcp never looks inside it. Copy into it anything from the request that
+tools need. They don't see the Rack env themselves.
+
+`_meta` is the hash as the client sent it, with string keys. A current client sends its name and
+capabilities in it on every request. An older client sends them only once, in `initialize`, so for
+its tool calls `_meta` is usually empty. A lambda taking only `env` works too.
 
 Mount it:
 
@@ -147,7 +157,8 @@ This is all of it. Everything else is private, whatever Ruby visibility it happe
 - `NanoMCP::Tool`: class methods `tool_name`, `title`, `description`, `input_schema`, `annotations`,
   `descriptor(context)`. Instance methods `#initialize(context)`, `#context`, `#invoke(arguments)`, `#call(**)`
 - `NanoMCP::Result`: `.text`, `.json`, `.error`, `#text`, `#structured`, `#error?`
-- `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, &authenticate)` and `#call(env)`
+- `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, &authenticate)` and `#call(env)`.
+  The block is called with `(env, meta)`
 
 ## Protocol behaviour
 

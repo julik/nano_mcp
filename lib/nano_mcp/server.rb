@@ -14,9 +14,14 @@ module NanoMCP
   # 2025-11-25 or earlier opens with `initialize` instead, and gets answered the way
   # those revisions expect - minus the session, which they never strictly needed.
   #
-  # The block authenticates. It receives the Rack env and returns the context every
-  # tool in this request gets, or nil/false to refuse the request with a 401. A block
-  # that raises refuses too.
+  # The block authenticates. It receives the Rack env and the request's `_meta`, and
+  # returns the context every tool in this request gets, or nil/false to refuse the
+  # request with a 401. A block that raises refuses too.
+  #
+  # `_meta` is the hash as the client sent it, string keys and all. A current client
+  # puts its identity there on every request, under "io.modelcontextprotocol/clientInfo".
+  # An older one sends it only once, in `initialize`, so for its tool calls `_meta`
+  # is usually empty.
   class Server
     MODERN_VERSIONS = [PROTOCOL_VERSION].freeze
     LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"].freeze
@@ -68,6 +73,7 @@ module NanoMCP
     # @param allowed_origins [Array<String>] browser origins allowed to call, none by default
     # @param logger [Logger, nil] gets a line per tool call and every internal error
     # @yieldparam env [Hash] the Rack env
+    # @yieldparam meta [Hash] the request's `params._meta`, empty when there is none
     # @yieldreturn [Object, nil] the tool context, or nil/false to refuse with a 401
     def initialize(name:, version:, tools:, title: nil, instructions: nil, allowed_origins: [], logger: nil, &authenticate)
       raise ArgumentError, "Pass a block which authenticates the request and returns the tool context, or nil to refuse" unless authenticate
@@ -102,20 +108,23 @@ module NanoMCP
         return respond(403, error_body(nil, INVALID_REQUEST, "Origin not allowed"))
       end
 
-      context = authenticate(env)
+      # Read before authenticating, since the block gets the request's _meta - but
+      # answered after, so a caller without a token learns nothing from its body
+      body = read_body(env)
+      request = begin
+        body && JSON.parse(body)
+      rescue JSON::ParserError
+        :unparseable
+      end
+
+      context = authenticate(env, request_meta(request))
       unless context
         return respond(401, error_body(nil, UNAUTHORIZED, "Unauthorized: send a valid bearer token in the Authorization header"),
           "www-authenticate" => %(Bearer realm="#{@name}"))
       end
 
-      body = read_body(env)
       return respond(413, error_body(nil, INVALID_REQUEST, "Request body over #{MAX_REQUEST_BYTES} bytes")) unless body
-
-      request = begin
-        JSON.parse(body)
-      rescue JSON::ParserError
-        return respond(400, error_body(nil, PARSE_ERROR, "Parse error: body is not valid JSON"))
-      end
+      return respond(400, error_body(nil, PARSE_ERROR, "Parse error: body is not valid JSON")) if request == :unparseable
 
       status, payload = handle(request, env, context)
       payload ? respond(status, payload) : [status, {}, []]
@@ -155,6 +164,12 @@ module NanoMCP
     def modern?(method, params, env)
       return false if method == "initialize"
       !meta_version(params).nil? || MODERN_VERSIONS.include?(env["HTTP_MCP_PROTOCOL_VERSION"])
+    end
+
+    def request_meta(request)
+      params = request.is_a?(Hash) ? request["params"] : nil
+      meta = params.is_a?(Hash) ? params["_meta"] : nil
+      meta.is_a?(Hash) ? meta.freeze : {}.freeze
     end
 
     def meta_version(params)
@@ -290,8 +305,13 @@ module NanoMCP
       {type: "text", text: string}
     end
 
-    def authenticate(env)
-      @authenticate.call(env)
+    def authenticate(env, meta)
+      # A lambda taking just the env would raise on a second argument, a block would not
+      if @authenticate.lambda? && @authenticate.arity == 1
+        @authenticate.call(env)
+      else
+        @authenticate.call(env, meta)
+      end
     rescue => e
       log(:error) { "authentication raised #{e.class}: #{e.message} - refusing" }
       nil
