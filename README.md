@@ -120,9 +120,18 @@ There are two hooks for house rules, both meant to be overridden in your own bas
 
 ```ruby
 class MyTool < NanoMCP::Tool
+  def self.mutating
+    @mutating = true
+    annotations readOnlyHint: false, destructiveHint: false
+  end
+
+  def self.mutating? = !!@mutating
+
   # Around every call: permission gates, log tags, timeouts
   def invoke(arguments)
-    return NanoMCP::Result.error("Mutations are disabled here") if mutating? && !context.mutations_permitted?
+    if self.class.mutating? && !context.mutations_permitted?
+      return NanoMCP::Result.error("Refused: mutations are disabled on this server")
+    end
     Rails.logger.tagged("mcp_tool=#{self.class.tool_name}") { super }
   end
 
@@ -132,6 +141,12 @@ class MyTool < NanoMCP::Tool
     entry[:description] += "\n\nDISABLED for you" if mutating? && !context.mutations_permitted?
     entry
   end
+end
+
+class PauseWorkflows < MyTool
+  tool_name "pause_workflows"
+  mutating
+  # ...
 end
 ```
 

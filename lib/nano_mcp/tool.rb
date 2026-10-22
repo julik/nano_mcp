@@ -84,7 +84,8 @@ module NanoMCP
         }.compact
       end
 
-      # @api private
+      private
+
       def json_schema
         @json_schema || EMPTY_JSON_SCHEMA
       end
@@ -104,7 +105,7 @@ module NanoMCP
     # @param arguments [Hash, nil] as they came off the wire
     # @return [Result]
     def invoke(arguments)
-      call(**Arguments.validate!(arguments, self.class.json_schema))
+      call(**Arguments.validate!(arguments, self.class.send(:json_schema)))
     end
 
     # Implement this. Receives the validated arguments as keywords; ones the caller
