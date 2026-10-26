@@ -3,7 +3,7 @@
 # A small cousin of geneva_drive_admin's MCP server, over an in-memory store of
 # workflows instead of a database. It exercises what the real ones need from nano_mcp:
 # a token, a context per request, cursor pagination, prose and structured answers,
-# and mutations behind a gate that also changes what tools/list says.
+# mutations behind a gate that also changes what tools/list says, and progress.
 #
 # Run it with `rackup examples/config.ru` and point a client at http://localhost:9292/mcp
 require "nano_mcp"
@@ -191,13 +191,16 @@ module WorkflowsMCP
       mutating
 
       def call(workflow_ids:, reason: nil)
-        outcomes = workflow_ids.uniq.map do |id|
+        ids = workflow_ids.uniq
+        outcomes = ids.each_with_index.map do |id, index|
+          progress(index, total: ids.length, message: "Pausing workflow #{id}")
           workflow = context.store.find(id)
           next {id: id, outcome: "not_found"} unless workflow
           next {id: id, outcome: "skipped", state: workflow.state} unless %w[ready performing].include?(workflow.state)
           context.store.update_state(id, "paused")
           {id: id, outcome: "paused", state: "paused"}
         end
+        progress(ids.length, total: ids.length)
         paused = outcomes.count { |o| o[:outcome] == "paused" }
         NanoMCP::Result.json({paused: paused, outcomes: outcomes}, summary: "Paused #{paused} of #{outcomes.length}.")
       end

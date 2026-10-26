@@ -23,7 +23,8 @@ A Rack app that serves [MCP](https://modelcontextprotocol.io) tools over Streama
 against the **stateless** revision of the spec, [2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28).
 It has:
 
-- no sessions, no SSE, no GET stream - every request is one POST, and any process can serve it
+- no sessions, no GET stream - every request is one POST, and any process can serve it. The only
+  SSE is a tool call's progress, streamed back as the answer to that one POST
 - no runtime dependencies - not even Rack, only `json` and `openssl` from the standard library
 - tools only - no resources, prompts, sampling or elicitation
 
@@ -117,6 +118,43 @@ The checker handles the top level of the schema: `type`, `required`, `enum`, `mi
 `minLength`, `maxLength`, `minItems`, `maxItems`, `items` and `default`. Unknown arguments are
 refused, and the schema sent to clients says `additionalProperties: false` to match. Integers sent
 as strings are accepted, because agents do that. A number over `maximum` is clamped down to it rather than refused.
+
+### Progress
+
+A tool that takes a while can say how far along it is:
+
+```ruby
+def call(workflow_ids:)
+  workflow_ids.each_with_index do |id, index|
+    progress(index, total: workflow_ids.length, message: "Pausing workflow #{id}")
+    # ...
+  end
+  progress(workflow_ids.length, total: workflow_ids.length)
+  NanoMCP::Result.text("Paused them all")
+end
+```
+
+`progress` must be a number, and so must `total` if you pass it. Each call becomes a
+`notifications/progress` - but only if the client asked for it. That is when all of these hold:
+
+- the request is a `tools/call`
+- it carries `params._meta.progressToken`, a string or an integer
+- its `Accept` header includes `text/event-stream`
+
+Then the answer is a 200 with `content-type: text/event-stream`: the notifications as the tool sends
+them, then the response as the last event, and the end. It is still stateless - no event ids, no
+resuming. In every other case `#progress` does nothing and the answer is the usual JSON, so a tool
+can call it unconditionally. Both eras get this, since older clients send `progressToken` the same way.
+
+A `progress` not greater than the one sent before is dropped, since the spec says it only ever increases.
+
+The tool runs on whatever thread your Rack server iterates the body on, and everything that can be
+refused with a 4xx - authentication, the body, the headers, an unknown tool - is refused before the
+stream starts. Nothing between the server and the client should buffer the body, so the stream goes
+out with `cache-control: no-cache, no-store, no-transform` (which `Rack::Deflater` and compressing
+proxies respect), `x-accel-buffering: no` (nginx, the Google load balancer) and a `last-modified` of
+now (which stops `Rack::ETag` on Rack 2 from buffering it to hash it). It has no `content-length`, and
+the body has no `to_ary`, so `Rack::ContentLength` leaves it alone. Other proxies may still need telling.
 
 ### Wrapping every tool
 
@@ -219,7 +257,8 @@ This is all of it. Everything else is private, whatever Ruby visibility it happe
 - `NanoMCP.bearer_token(env)`, `NanoMCP.token_matches?(presented, configured)`
 - `NanoMCP::Error`, `NanoMCP::ToolError`
 - `NanoMCP::Tool`: class methods `tool_name`, `title`, `description`, `input_schema`, `annotations`,
-  `descriptor(context)`. Instance methods `#initialize(context)`, `#context`, `#invoke(arguments)`, `#call(**)`
+  `descriptor(context)`. Instance methods `#initialize(context)`, `#context`, `#invoke(arguments)`, `#call(**)`,
+  `#progress(progress, total: nil, message: nil)`
 - `NanoMCP::Result`: `.text`, `.json`, `.error`, `#text`, `#structured`, `#error?`
 - `NanoMCP::Server`: `.new(name:, version:, tools:, title:, instructions:, allowed_origins:, logger:, on_call:, &authenticate)` and `#call(env)`.
   The block is called with `(env, meta)`
@@ -241,6 +280,8 @@ In both eras:
 - GET, DELETE and other verbs get a 405.
 - No session id is ever issued.
 - A notification gets an empty 202.
+- A `tools/call` with a `progressToken` from a client that accepts `text/event-stream` gets its
+  progress and its response as an event stream. Everything else is answered with JSON.
 - Batches are refused.
 - A request with an `Origin` header is refused with a 403 unless that origin is in
   `allowed_origins`. MCP clients don't send `Origin`, browsers do. Comparing it against the

@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
   spec.email = ["me@julik.nl"]
   spec.license = "MIT"
   spec.summary = "A (slightly unhinged) library for building small MCPs"
-  spec.description = "A Rack app serving MCP tools over stateless Streamable HTTP, per MCP revision 2026-07-28. No sessions, no streams, no dependencies."
+  spec.description = "A Rack app serving MCP tools over stateless Streamable HTTP, per MCP revision 2026-07-28. No sessions, no GET stream, no dependencies."
   spec.homepage = "https://github.com/julik/nano_mcp"
   spec.required_ruby_version = ">= 3.2.0"
 
