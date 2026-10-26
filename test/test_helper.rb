@@ -3,6 +3,10 @@
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "nano_mcp"
 require "rack/mock"
+require "rack/lint"
+require "rack/etag"
+require "rack/deflater"
+require "rack/content_length"
 require "logger"
 require "stringio"
 require "minitest/autorun"

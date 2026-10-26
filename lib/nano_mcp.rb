@@ -2,6 +2,7 @@
 
 require "json"
 require "openssl"
+require "time"
 
 # A Rack app serving MCP tools over stateless Streamable HTTP.
 #

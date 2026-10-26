@@ -150,8 +150,11 @@ A `progress` not greater than the one sent before is dropped, since the spec say
 
 The tool runs on whatever thread your Rack server iterates the body on, and everything that can be
 refused with a 4xx - authentication, the body, the headers, an unknown tool - is refused before the
-stream starts. Nothing between the server and the client should buffer the body: nano_mcp sends
-`x-accel-buffering: no` for nginx, but other proxies may need telling.
+stream starts. Nothing between the server and the client should buffer the body, so the stream goes
+out with `cache-control: no-cache, no-store, no-transform` (which `Rack::Deflater` and compressing
+proxies respect), `x-accel-buffering: no` (nginx, the Google load balancer) and a `last-modified` of
+now (which stops `Rack::ETag` on Rack 2 from buffering it to hash it). It has no `content-length`, and
+the body has no `to_ary`, so `Rack::ContentLength` leaves it alone. Other proxies may still need telling.
 
 ### Wrapping every tool
 

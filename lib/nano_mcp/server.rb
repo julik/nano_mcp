@@ -51,8 +51,15 @@ module NanoMCP
     # Methods whose `Mcp-Name` header mirrors a body param
     NAMED_METHODS = {"tools/call" => "name", "prompts/get" => "name", "resources/read" => "uri"}.freeze
 
-    # No content-length, so it goes out as it comes, and x-accel-buffering stops nginx sitting on it
-    STREAM_HEADERS = {"content-type" => "text/event-stream", "cache-control" => "no-cache", "x-accel-buffering" => "no"}.freeze
+    # The body has no `to_ary`, so Rack::ContentLength and Rack 3's Rack::ETag leave it alone,
+    # and the server sends it as it comes. `last-modified` gets added per response
+    STREAM_HEADERS = {
+      "content-type" => "text/event-stream",
+      # no-transform makes Rack::Deflater and compressing proxies leave us be. `content-encoding:
+      # identity` does not, Deflater gzips those just the same
+      "cache-control" => "no-cache, no-store, no-transform",
+      "x-accel-buffering" => "no" # nginx and the Google load balancer
+    }.freeze
 
     private_constant(*constants)
 
@@ -170,7 +177,8 @@ module NanoMCP
       status, payload = handle(request, env, context)
       case payload
       when nil then [status, {}, []]
-      when ProgressStream then [status, STREAM_HEADERS.dup, payload]
+      # Rack 2's Rack::ETag buffers any body to hash it, unless there already is a last-modified
+      when ProgressStream then [status, STREAM_HEADERS.merge("last-modified" => Time.now.httpdate), payload]
       else respond(status, payload)
       end
     end

@@ -52,9 +52,11 @@ class ProgressTest < Minitest::Test
   def test_streams_the_notifications_then_the_response
     assert_equal 200, streaming_call("count")
     assert_equal "text/event-stream", @headers["content-type"]
-    assert_equal "no-cache", @headers["cache-control"]
+    assert_equal "no-cache, no-store, no-transform", @headers["cache-control"]
     assert_equal "no", @headers["x-accel-buffering"]
+    assert_in_delta Time.now, Time.httpdate(@headers["last-modified"]), 5
     refute @headers.key?("content-length")
+    refute @headers.key?("content-encoding")
 
     *notifications, response = events
     assert_equal [
@@ -77,6 +79,25 @@ class ProgressTest < Minitest::Test
     _, _, body = app.call(env)
     assert_empty trail, "The tool runs when the body is iterated, not before"
     body.each { |chunk| trail << chunk[/"method":"([^"]+)"/, 1] }
+    assert_equal ["notifications/progress", :tool_went_on, nil], trail
+  end
+
+  def test_buffering_middleware_lets_the_stream_through
+    trail = []
+    server = NanoMCP::Server.new(name: "p", version: "1", tools: [Watched]) { trail }
+    stack = Rack::Lint.new(Rack::ETag.new(Rack::Deflater.new(Rack::ContentLength.new(Rack::Lint.new(server)))))
+    env = Rack::MockRequest.env_for("http://mcp.example.com/mcp", :method => "POST",
+      "HTTP_ACCEPT" => "text/event-stream", "HTTP_ACCEPT_ENCODING" => "gzip",
+      :input => JSON.generate({jsonrpc: "2.0", id: 1, method: "tools/call", params: {name: "watched", _meta: {progressToken: 1}}}))
+    status, headers, body = stack.call(env)
+
+    assert_equal 200, status
+    refute headers.key?("etag")
+    refute headers.key?("content-length")
+    refute headers.key?("content-encoding")
+    assert_empty trail, "Nothing may have iterated the body yet"
+    body.each { |chunk| trail << JSON.parse(chunk.delete_prefix("event: message\ndata: "))["method"] }
+    body.close
     assert_equal ["notifications/progress", :tool_went_on, nil], trail
   end
 
