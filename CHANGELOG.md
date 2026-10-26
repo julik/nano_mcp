@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- `Tool#progress` sends `notifications/progress` while a tool runs. A `tools/call` carrying a
+  `progressToken` from a client that accepts `text/event-stream` is answered as an event stream:
+  the progress, then the response. Anything else is answered exactly as before, and `#progress`
+  does nothing.
+
 ## 0.2.0
 
 - `Result.json` without a `summary:` now puts a line like "12 workflows in structuredContent."

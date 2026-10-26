@@ -8,7 +8,7 @@ module NanoMCP
   #   end
   #   mount SERVER => "/mcp"
   #
-  # Stateless all the way down: no sessions, no streams, nothing remembered between
+  # Stateless all the way down: no sessions, no GET stream, nothing remembered between
   # requests, so any process can answer any request. It speaks revision 2026-07-28,
   # where every request carries its own protocol version in `_meta`. A client of
   # 2025-11-25 or earlier opens with `initialize` instead, and gets answered the way
@@ -51,6 +51,9 @@ module NanoMCP
     # Methods whose `Mcp-Name` header mirrors a body param
     NAMED_METHODS = {"tools/call" => "name", "prompts/get" => "name", "resources/read" => "uri"}.freeze
 
+    # No content-length, so it goes out as it comes, and x-accel-buffering stops nginx sitting on it
+    STREAM_HEADERS = {"content-type" => "text/event-stream", "cache-control" => "no-cache", "x-accel-buffering" => "no"}.freeze
+
     private_constant(*constants)
 
     class ProtocolError < StandardError
@@ -64,6 +67,42 @@ module NanoMCP
       end
     end
     private_constant :ProtocolError
+
+    # The body of a tools/call answered as an event stream: the progress notifications
+    # as the tool sends them, then the response, then the end. Still stateless - no event
+    # ids, nothing to resume. The tool runs inside #each, on the thread the Rack server
+    # iterates the body on, so it holds what one call needs and nothing outlives it
+    class ProgressStream
+      def initialize(token, &respond)
+        @token = token
+        @respond = respond
+      end
+
+      def each(&write)
+        return enum_for(:each) unless block_given?
+        @write = write
+        response = @respond.call(self)
+        write.call(event(response))
+      ensure
+        @write = nil
+      end
+
+      def progress(progress, total, message)
+        return unless @write
+        return if @last_progress && progress <= @last_progress
+        @last_progress = progress
+        params = {progressToken: @token, progress: progress, total: total, message: message}.compact
+        @write.call(event({jsonrpc: "2.0", method: "notifications/progress", params: params}))
+      end
+
+      private
+
+      # JSON.generate escapes newlines, so the payload always fits on one data line
+      def event(message)
+        "event: message\ndata: #{JSON.generate(message)}\n\n"
+      end
+    end
+    private_constant :ProgressStream
 
     # @param name [String] `serverInfo.name`, which clients key on - keep it fixed
     # @param version [String] `serverInfo.version`
@@ -129,7 +168,11 @@ module NanoMCP
       return respond(400, error_body(nil, PARSE_ERROR, "Parse error: body is not valid JSON")) if request == :unparseable
 
       status, payload = handle(request, env, context)
-      payload ? respond(status, payload) : [status, {}, []]
+      case payload
+      when nil then [status, {}, []]
+      when ProgressStream then [status, STREAM_HEADERS.dup, payload]
+      else respond(status, payload)
+      end
     end
 
     private
@@ -149,15 +192,46 @@ module NanoMCP
 
       modern = modern?(method, params, env)
       validate_modern_request!(method, params, env) if modern
-      result = dispatch(method, params, context, modern)
-      result[:resultType] = "complete" if modern
-      [200, {jsonrpc: "2.0", id: id, result: result}]
+
+      # Everything that can be refused with a real status has been by now, and the
+      # tool lookup goes first too. Past this point we owe the client a 200 stream
+      if method == "tools/call" && (token = progress_token(params)) && accepts_event_stream?(env)
+        tool = find_tool!(params)
+        stream = ProgressStream.new(token) do |progress_stream|
+          success_body(id, call_tool(tool, params, context, modern, progress_stream), modern)
+        rescue => e
+          internal_error_body(id, method, e)
+        end
+        return [200, stream]
+      end
+
+      [200, success_body(id, dispatch(method, params, context, modern), modern)]
     rescue ProtocolError => e
       [e.status, error_body(id, e.code, e.message, e.data)]
     rescue => e
+      [200, internal_error_body(id, method, e)]
+    end
+
+    def success_body(id, result, modern)
+      result[:resultType] = "complete" if modern
+      {jsonrpc: "2.0", id: id, result: result}
+    end
+
+    def internal_error_body(id, method, e)
       log(:error) { "#{method} raised #{e.class}: #{e.message}\n#{Array(e.backtrace).first(10).join("\n")}" }
       # The message may carry the host's data, so it stays in the host's logs
-      [200, error_body(id, INTERNAL_ERROR, "Internal error (#{e.class}). See the server logs.")]
+      error_body(id, INTERNAL_ERROR, "Internal error (#{e.class}). See the server logs.")
+    end
+
+    # Both eras send it in `_meta`, and the spec allows a string or an integer
+    def progress_token(params)
+      meta = params["_meta"]
+      token = meta.is_a?(Hash) ? meta["progressToken"] : nil
+      (token.is_a?(String) || token.is_a?(Integer)) ? token : nil
+    end
+
+    def accepts_event_stream?(env)
+      env["HTTP_ACCEPT"].to_s.split(",").any? { |type| type.split(";").first.to_s.strip.casecmp?("text/event-stream") }
     end
 
     # The spec's rule for serving both eras: `initialize` always selects the old one,
@@ -222,7 +296,7 @@ module NanoMCP
       in ["initialize", false] then initialize_result(params)
       in ["ping", false] then {}
       in ["tools/list", _] then tools_list_result(context, modern)
-      in ["tools/call", _] then call_tool(params, context, modern)
+      in ["tools/call", _] then call_tool(find_tool!(params), params, context, modern)
       else
         # In the current revision the 404 is how a client tells "no such method"
         # apart from "not an MCP endpoint at all"
@@ -260,16 +334,21 @@ module NanoMCP
       modern ? result.merge(ttlMs: TOOL_LIST_TTL_MS, cacheScope: CACHE_SCOPE) : result
     end
 
-    def call_tool(params, context, modern)
+    def find_tool!(params)
       name = params["name"]
       raise ProtocolError.new("tools/call needs a tool name", code: INVALID_PARAMS) unless name.is_a?(String)
-      tool = @tools.fetch(name) { raise ProtocolError.new("Unknown tool: #{name}. Call tools/list to see what this server offers.", code: INVALID_PARAMS) }
+      @tools.fetch(name) { raise ProtocolError.new("Unknown tool: #{name}. Call tools/list to see what this server offers.", code: INVALID_PARAMS) }
+    end
 
+    def call_tool(tool, params, context, modern, progress_stream = nil)
+      name = params["name"]
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       era = modern ? "modern" : "legacy"
       begin
         result = begin
-          tool.new(context).invoke(params["arguments"])
+          instance = tool.new(context)
+          instance.send(:stream_progress_to, progress_stream) if progress_stream
+          instance.invoke(params["arguments"])
         rescue ToolError => e
           Result.error(e.message)
         end

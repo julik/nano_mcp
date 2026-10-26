@@ -116,5 +116,27 @@ module NanoMCP
     def call(**)
       raise NotImplementedError, "#{self.class} must implement #call"
     end
+
+    # Tells the client how far along the call is, as a `notifications/progress`. It only
+    # goes out when the client asked for progress and accepts an event stream - otherwise
+    # it does nothing, so a tool can always call it. A `progress` not greater than the one
+    # sent before is dropped, since the spec wants it to only ever increase.
+    #
+    # @param progress [Numeric] how much is done so far
+    # @param total [Numeric, nil] how much there is to do, if known
+    # @param message [String, nil] what is happening, for a human
+    # @return [nil]
+    def progress(progress, total: nil, message: nil)
+      raise ArgumentError, "progress must be a number, got #{progress.inspect}" unless progress.is_a?(Numeric)
+      raise ArgumentError, "total must be a number, got #{total.inspect}" unless total.nil? || total.is_a?(Numeric)
+      @progress_stream&.progress(progress, total, message&.to_s)
+      nil
+    end
+
+    private
+
+    def stream_progress_to(stream)
+      @progress_stream = stream
+    end
   end
 end

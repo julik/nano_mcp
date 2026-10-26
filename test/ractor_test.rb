@@ -5,6 +5,15 @@ require "test_helper"
 # Smoke tests, not guarantees: a server has to answer from inside non-main Ractors,
 # both when each Ractor builds its own and when one is built up front and shared
 class RactorTest < Minitest::Test
+  class Count < NanoMCP::Tool
+    tool_name "count"
+
+    def call
+      3.times { |n| progress(n + 1, total: 3) }
+      NanoMCP::Result.text("counted")
+    end
+  end
+
   def test_servers_answer_from_inside_ractors
     previous, Warning[:experimental] = Warning[:experimental], false
 
@@ -105,6 +114,36 @@ class RactorTest < Minitest::Test
       status, body = ractor.respond_to?(:value) ? ractor.value : ractor.take
       assert_equal 200, status
       assert_equal "client#{index}", body.dig("result", "structuredContent", "identity")
+    end
+  ensure
+    Warning[:experimental] = previous
+  end
+
+  def test_one_shareable_server_streams_progress_from_several_ractors
+    previous, Warning[:experimental] = Warning[:experimental], false
+
+    authenticate = nil.instance_eval { proc { :anyone } }
+    server = Ractor.make_shareable(NanoMCP::Server.new(name: "shared", version: "1", tools: [Count], &authenticate))
+
+    ractors = 4.times.map do |index|
+      Ractor.new(server, index) do |server, index|
+        env = {
+          "REQUEST_METHOD" => "POST",
+          "rack.input" => StringIO.new(JSON.generate({jsonrpc: "2.0", id: index, method: "tools/call", params: {name: "count", _meta: {progressToken: "r#{index}"}}})),
+          "HTTP_ACCEPT" => "text/event-stream"
+        }
+        status, headers, body = server.call(env)
+        [status, headers["content-type"], body.each.to_a]
+      end
+    end
+
+    ractors.each_with_index do |ractor, index|
+      status, content_type, chunks = ractor.respond_to?(:value) ? ractor.value : ractor.take
+      assert_equal 200, status
+      assert_equal "text/event-stream", content_type
+      messages = chunks.map { |chunk| JSON.parse(chunk.delete_prefix("event: message\ndata: ")) }
+      assert_equal ["r#{index}"] * 3, messages[0..2].map { |m| m.dig("params", "progressToken") }
+      assert_equal index, messages.last["id"]
     end
   ensure
     Warning[:experimental] = previous
